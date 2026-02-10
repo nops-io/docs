@@ -1,0 +1,907 @@
+---
+title: "GCP Commitment Management Setup"
+description: "Configure nOps to manage GCP Committed Use Discounts (CUDs) on your behalf, including Resource-based and Spend-based commitments."
+icon: "cloud"
+---
+
+## FAQs
+
+<AccordionGroup>
+  <Accordion title="What is GCP Commitment Management?">
+    GCP Commitment Management enables nOps to autonomously purchase, manage, and optimize Committed Use Discounts (CUDs) on your behalf. This includes both Resource-based CUDs (project-level) and Spend-based (Flex) CUDs (billing account-level).
+  </Accordion>
+  <Accordion title="What's the difference between Resource-based and Spend-based CUDs?">
+    - **Resource-based CUDs**: Purchased at the project level for specific machine families. Requires CUD sharing to be enabled to apply discounts across projects.
+    - **Spend-based (Flex) CUDs**: Purchased at the billing account level and automatically apply to all eligible usage across all projects.
+  </Accordion>
+  <Accordion title="Do I need to enable CUD sharing?">
+    Yes, for Resource-based CUDs. CUD sharing is **disabled by default** in GCP and must be enabled before nOps can share purchased commitments across your projects.
+  </Accordion>
+  <Accordion title="Why are there two access paths (Automation Agent and Human Manager)?">
+    - **Automation Agent**: A service account used by nOps for autonomous purchasing, quota management, and self-healing operations.
+    - **Human Manager**: A group email provided by nOps for console access, manual overrides, dashboards, and verification.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Overview
+
+This guide covers the permissions and configuration steps required to enable nOps to manage GCP Committed Use Discounts (CUDs) on your behalf. The setup involves two distinct access paths:
+
+1. **Automation Agent (Service Account)** -- For autonomous purchasing, reliability (quota fixing), and self-healing
+2. **Human Manager (nOps Group Email)** -- For UI access, dashboards, and manual override capabilities
+
+<Info>
+**Prerequisites** -- Before configuring Commitment Management, ensure you have completed:
+- GCP Integration Prerequisites -- Billing exports and domain sharing configuration
+- GCP Integration Setup -- Basic nOps integration with service account
+
+You will need the **nOps Service Account email** from your existing integration.
+</Info>
+
+---
+
+## Requirements for Savings Analysis
+
+<Warning>
+**Provide All Billing Accounts** -- If you want nOps to perform a **savings analysis**, you must provide **all billing accounts** associated with your GCP organization. This is required for:
+
+- **Complete Visibility**: Ensuring comprehensive spend analysis across your entire GCP footprint
+- **Accurate Recommendations**: Generating commitment recommendations based on complete usage patterns
+- **Optimal Savings**: Identifying cross-project and cross-billing account optimization opportunities
+- **Proper Coverage Calculation**: Accurately assessing commitment coverage across all projects
+
+**Without access to all billing accounts, the savings analysis will be incomplete and recommendations may be suboptimal.**
+</Warning>
+
+---
+
+## Permission Upgrade Path
+
+Commitment Management requires elevated permissions beyond the basic nOps integration. If you have already completed the GCP Integration Setup, the nOps service account has **Viewer-level** roles. To enable Commitment Management, these must be upgraded to include permissions for **purchasing and managing CUDs**.
+
+### Role Upgrade Summary
+
+| Scope | Basic Integration (Viewer) | Commitment Management (Purchasing) |
+|-------|---------------------------|-------------------------------|
+| Organization | `roles/browser`, `roles/cloudasset.viewer`, `roles/recommender.viewer`, `roles/compute.viewer` | + `roles/cloudsupport.techSupportEditor` *(paid support plans only)* |
+| Billing Account | `roles/billing.viewer` | + `roles/consumerprocurement.orderAdmin` *(for spend-based CUD purchasing)* |
+| Project (CUD Project) | — | `roles/compute.viewer` + Custom `nOpsResourceManager` role *(includes `compute.commitments.create`)* |
+
+<Info>
+**Key Purchasing Permissions**
+- **Resource-based CUDs**: Purchased via Compute Engine API using `compute.commitments.create` permission (in the custom `nOpsResourceManager` role at **project level**)
+- **Spend-based (Flex) CUDs**: Purchased via Procurement API using `roles/consumerprocurement.orderAdmin` (at **billing account level**)
+</Info>
+
+### Verify Current Permissions
+
+Before upgrading, verify the current permissions assigned to the nOps service account:
+
+<Tabs>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your values
+NOPS_SERVICE_ACCOUNT="your-nops-sa@project.iam.gserviceaccount.com"
+ORGANIZATION_ID="123456789012"
+BILLING_ACCOUNT_ID="XXXXXX-XXXXXX-XXXXXX"
+
+# Check organization-level roles
+echo "=== Organization Roles ==="
+gcloud organizations get-iam-policy $ORGANIZATION_ID \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --format="table(bindings.role)"
+
+# Check billing account roles
+echo "=== Billing Account Roles ==="
+gcloud billing accounts get-iam-policy $BILLING_ACCOUNT_ID \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --format="table(bindings.role)"
+```
+  </Tab>
+  <Tab title="Console">
+1. Go to **IAM & Admin → IAM** in the [Google Cloud Console](https://console.cloud.google.com/iam-admin/iam).
+2. Select your **Organization** from the dropdown.
+3. Search for the nOps service account email in the filter.
+4. Review the assigned roles in the **Role** column.
+5. Repeat for your **Billing Account** (Billing → Account Management → Show info panel).
+  </Tab>
+</Tabs>
+
+### Test Required Permissions
+
+After completing the setup, verify the service account has the required permissions for Commitment Management:
+
+```bash
+# Test commitment permissions on the CUD project
+PROJECT_ID="nops-cud-purchases"
+
+gcloud asset search-all-iam-policies \
+    --scope="projects/$PROJECT_ID" \
+    --query="policy:$NOPS_SERVICE_ACCOUNT" \
+    --format="table(resource, policy.bindings.role)"
+
+# Verify compute commitment permissions
+gcloud projects test-iam-permissions $PROJECT_ID \
+    --permissions=compute.commitments.create,compute.commitments.list,compute.commitments.get
+```
+
+<Tip>
+After completing all setup steps, use the [Verification Checklist](#verification-checklist) at the end of this guide to confirm all permissions are correctly configured.
+</Tip>
+
+---
+
+## Step 1: Enable CUD Sharing
+
+CUD sharing is **disabled by default** in GCP. This must be enabled for Resource-based CUD discounts to apply across multiple projects in your billing account.
+
+<Accordion title="Watch: Enabling CUD Sharing">
+![GIF showing how to enable CUD sharing](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/enable_cud_sharing.gif)
+</Accordion>
+
+<Warning>
+**Required Permission** -- You must have the **Billing Account Administrator** role (which includes `billing.subscriptions.update` permission) to enable CUD sharing.
+</Warning>
+
+<Warning>
+**Cannot Be Disabled** -- After you enable CUD sharing in the Google Cloud console, **you cannot disable the setting** and revert to Project scope. Cloud Billing Support must perform this action for you. If disabled, the reverted setting becomes effective at the beginning of the following month.
+</Warning>
+
+<Steps>
+  <Step title="Navigate to CUD Analysis">
+    Go to **Billing** in the [Google Cloud Console](https://console.cloud.google.com/billing). Select your billing account and click **CUD analysis** in the left menu.
+  </Step>
+  <Step title="Select Resource-based CUDs">
+    In the **Analyze** dropdown menu, select **Resource-based CUDs**.
+  </Step>
+  <Step title="Check Commitment Scope">
+    In the **Spend covered by CUDs** section, locate the **Commitment scope** field (directly below the section header). The field will show one of:
+    - **CUDs scoped to project** -- CUD sharing is not enabled
+    - **CUDs scoped to Billing account** -- CUD sharing is already enabled (no action needed)
+  </Step>
+  <Step title="Edit Commitment Scope">
+    Click the **Edit** link next to the commitment scope.
+
+    <Frame>
+      ![CUD Analysis commitment scope setting](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/cud_analysis_scope.png)
+    </Frame>
+  </Step>
+  <Step title="Confirm Enablement">
+    A confirmation dialog will appear. The dialog explains that **Billing account scope commitments** apply discounts across all eligible usage (all projects) associated with the billing account. Type **`Enable`** in the text field and click **Enable billing account scope**.
+
+    <Frame>
+      ![CUD sharing confirmation dialog](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/cud_sharing_confirmation_dialog.png)
+    </Frame>
+  </Step>
+</Steps>
+
+<Info>
+**Propagation Delay** -- It can take up to **24 hours** for the updated commitment scope to take effect. After 24 hours, confirm that your billing scope is set to Billing Account. If your commitment scope remains the same after 24 hours, contact Cloud Billing Support.
+</Info>
+
+<Tip>
+**Spend-based CUDs** automatically apply across all projects in the billing account without requiring CUD sharing to be enabled.
+</Tip>
+
+---
+
+## Step 2: Create a Dedicated Project for CUD Purchases
+
+nOps requires a dedicated GCP project where **all resource-based commitments** will be purchased on your behalf. This project serves as the central location for all CUD purchases managed by nOps automation.
+
+<Warning>
+This dedicated project is where nOps will purchase **all resource-based commitments** for your organization. With [CUD sharing enabled](#step-1-enable-cud-sharing), the discounts from commitments purchased in this project automatically apply across **all projects** in your billing account.
+</Warning>
+
+<Info>
+**Why a Dedicated Project?**
+- **Centralized Purchasing**: nOps purchases all resource-based CUDs from this single project using the Compute Engine API.
+- **Clear Ownership**: Easily identify and audit nOps-managed commitments in your billing reports and GCP Console.
+- **Simplified IAM**: Grant nOps the custom `nOpsResourceManager` role only on this project, following least-privilege principles.
+- **CUD Sharing Distribution**: With billing account scope enabled, discounts automatically apply to eligible usage across all linked projects.
+- **Separation of Concerns**: Keep commitment management separate from your workload projects.
+</Info>
+
+<Accordion title="Watch: Creating a Dedicated Project for CUD Purchases">
+![GIF showing project creation](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/create_cud_project.gif)
+</Accordion>
+
+<Tabs>
+  <Tab title="Console">
+1. Go to **IAM & Admin → Create a Project** in the [Google Cloud Console](https://console.cloud.google.com/projectcreate).
+2. Enter the following details:
+   - **Project name**: `nops-cud-purchases` (or your preferred name)
+   - **Organization**: Select your organization
+   - **Location**: Select the appropriate folder or organization root
+3. Click **Create**.
+
+<Frame>
+  ![Create project dialog](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/create_project.png)
+</Frame>
+
+4. After the project is created, go to **Billing** in the [Google Cloud Console](https://console.cloud.google.com/billing).
+5. Select your billing account and click **Account Management**.
+6. Verify that the new project appears in the **Projects linked to this billing account** list. If not listed, click **Link a project** and select the newly created project.
+
+<Frame>
+  ![Projects linked to billing account](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/link_project_billing.png)
+</Frame>
+  </Tab>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your values
+PROJECT_ID="nops-cud-purchases"
+PROJECT_NAME="nOps CUD Purchases"
+ORGANIZATION_ID="123456789012"
+BILLING_ACCOUNT_ID="XXXXXX-XXXXXX-XXXXXX"
+
+# Create the project
+gcloud projects create $PROJECT_ID \
+    --name="$PROJECT_NAME" \
+    --organization=$ORGANIZATION_ID
+
+# Link the project to your billing account
+gcloud billing projects link $PROJECT_ID \
+    --billing-account=$BILLING_ACCOUNT_ID
+```
+  </Tab>
+  <Tab title="Terraform">
+```hcl
+# Create a dedicated project for nOps CUD purchases
+resource "google_project" "nops_cud_project" {
+  name            = "nOps CUD Purchases"
+  project_id      = "nops-cud-purchases"  # Must be globally unique
+  org_id          = "123456789012"         # Your Organization ID
+  billing_account = "XXXXXX-XXXXXX-XXXXXX" # Your Billing Account ID
+
+  labels = {
+    purpose    = "nops-commitment-management"
+    managed-by = "nops"
+  }
+}
+
+# Enable required APIs on the CUD project
+resource "google_project_service" "cud_project_apis" {
+  for_each = toset([
+    "compute.googleapis.com",
+    "cloudcommerceconsumerprocurement.googleapis.com",
+    "cloudasset.googleapis.com",
+    "cloudquotas.googleapis.com",
+    "serviceusage.googleapis.com",
+    "recommender.googleapis.com",
+  ])
+
+  project = google_project.nops_cud_project.project_id
+  service = each.value
+
+  disable_on_destroy = false
+}
+
+output "cud_project_id" {
+  description = "The Project ID for CUD purchases - provide this to nOps"
+  value       = google_project.nops_cud_project.project_id
+}
+```
+  </Tab>
+</Tabs>
+
+<Warning>
+Make sure to note the **Project ID** of this dedicated project. You will need to provide this to nOps and grant the necessary permissions to this project in the following steps.
+</Warning>
+
+<Tip>
+**How Discounts Apply** -- When nOps purchases a resource-based commitment (e.g., 8 vCPUs + 32GB memory for N2 machine family in `us-central1`) in this dedicated project:
+1. The commitment is created via the Compute Engine API
+2. With CUD sharing enabled, the discount automatically applies to **any eligible N2 usage** across **all projects** in your billing account
+3. You can view the commitment in GCP Console under **Compute Engine → Committed use discounts**
+</Tip>
+
+---
+
+## Step 3: Create Custom Role for Commitment Management
+
+Create a custom role with the minimum permissions required for nOps to manage commitments and quotas.
+
+<Accordion title="Watch: Creating Custom Role for Commitment Management">
+![GIF showing custom role creation](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/create_custom_role.gif)
+</Accordion>
+
+<Info>
+All permissions in this custom role have been verified against Google Cloud IAM documentation. Using unverified permissions will cause the role creation to fail.
+</Info>
+
+<Tabs>
+  <Tab title="Console">
+#### Navigate to IAM Roles
+
+1. Go to **IAM & Admin → Roles** in the [Google Cloud Console](https://console.cloud.google.com/iam-admin/roles).
+2. Select your **Organization** from the project/organization selector.
+
+#### Create the Custom Role
+
+1. Click **+ Create Role**.
+2. Enter the following details:
+   - **Title**: `nOps Resource Manager`
+   - **ID**: `nOpsResourceManager`
+   - **Description**: `Least-privilege role for managing Compute Commitments and Quotas`
+   - **Role launch stage**: `General Availability`
+3. Click **+ Add Permissions** and add the following permissions:
+
+**Compute Lifecycle**:
+- `compute.commitments.create`
+- `compute.commitments.update`
+- `compute.commitments.updateReservations`
+- `compute.commitments.get`
+- `compute.commitments.list`
+- `compute.regionOperations.get`
+
+**Quota Management**:
+- `serviceusage.quotas.get`
+- `serviceusage.quotas.update`
+- `serviceusage.services.get`
+- `serviceusage.services.list`
+- `cloudquotas.quotas.get`
+- `cloudquotas.quotas.update`
+
+**Asset Export**:
+- `cloudasset.assets.exportResource`
+
+**Monitoring**:
+- `monitoring.timeSeries.list`
+
+4. Click **Create**.
+  </Tab>
+  <Tab title="gcloud CLI">
+Create a YAML file named `nops-resource-manager-role.yaml`:
+
+```yaml
+title: "nOps Resource Manager"
+description: "Least-privilege role for managing Compute Commitments and Quotas"
+stage: "GA"
+includedPermissions:
+  # Compute Lifecycle (Action Layer)
+  - compute.commitments.create
+  - compute.commitments.update
+  - compute.commitments.updateReservations
+  - compute.commitments.get
+  - compute.commitments.list
+  - compute.regionOperations.get
+  # Reliability (Auto-Fix Quotas)
+  - serviceusage.quotas.get
+  - serviceusage.quotas.update
+  - serviceusage.services.get
+  - serviceusage.services.list
+  - cloudquotas.quotas.get
+  - cloudquotas.quotas.update
+  # Asset Export (Bulk Visibility)
+  - cloudasset.assets.exportResource
+  # Monitoring
+  - monitoring.timeSeries.list
+```
+
+Create the custom role at the organization level:
+
+```bash
+# Get your Organization ID
+gcloud organizations list
+
+# Replace with your Organization ID
+ORGANIZATION_ID="123456789012"
+
+# Create the custom role
+gcloud iam roles create nOpsResourceManager \
+    --organization=$ORGANIZATION_ID \
+    --file=nops-resource-manager-role.yaml
+```
+  </Tab>
+</Tabs>
+
+---
+
+## Step 4: Configure Automation Agent (Service Account)
+
+Grant the nOps service account the necessary roles for autonomous commitment management.
+
+### A. Organization-Level Roles
+
+<Accordion title="Watch: Granting Organization-Level Roles for Commitment Management">
+![GIF showing organization role assignment](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/grant_org_roles.gif)
+</Accordion>
+
+<Tabs>
+  <Tab title="Console">
+1. Go to **IAM & Admin → IAM** in the [Google Cloud Console](https://console.cloud.google.com/iam-admin/iam).
+2. Select your **Organization** from the top dropdown.
+3. Click **+ Grant Access**.
+4. Enter the nOps service account email in the **New principals** field.
+5. Add the following roles:
+   - **Browser** (`roles/browser`)
+   - **Cloud Support Tech Support Editor** (`roles/cloudsupport.techSupportEditor`) -- *If you have a paid support plan (Standard/Enhanced/Premium)*
+6. Click **Save**.
+  </Tab>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your values
+NOPS_SERVICE_ACCOUNT="your-nops-sa@project.iam.gserviceaccount.com"
+ORGANIZATION_ID="123456789012"
+
+# Grant organization-level roles
+gcloud organizations add-iam-policy-binding $ORGANIZATION_ID \
+    --member="serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --role="roles/browser" \
+    --quiet
+
+# If you have a paid support plan (Standard/Enhanced/Premium):
+gcloud organizations add-iam-policy-binding $ORGANIZATION_ID \
+    --member="serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --role="roles/cloudsupport.techSupportEditor" \
+    --quiet
+```
+  </Tab>
+</Tabs>
+
+### B. Billing Account Roles
+
+These roles enable nOps to purchase spend-based (Flex) CUDs and access billing data and recommendations.
+
+<Accordion title="Watch: Granting Billing Account Roles for Commitment Management">
+![GIF showing billing account role assignment](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/grant_billing_roles.gif)
+</Accordion>
+
+<Tabs>
+  <Tab title="Console">
+1. Go to **Billing → Account Management** in the [Google Cloud Console](https://console.cloud.google.com/billing).
+2. Click **Show info panel** in the top-right corner.
+3. Click **+ Add Principal**.
+4. Enter the nOps service account email.
+5. Add the following roles:
+   - **Billing Account Viewer** (`roles/billing.viewer`) -- View spend data and billing information
+   - **Consumer Procurement Order Admin** (`roles/consumerprocurement.orderAdmin`) -- **Purchase spend-based (Flex) CUDs** via Procurement API
+   - **Recommender Billing Account CUD Admin** (`roles/recommender.billingAccountCudAdmin`) -- Access CUD recommendations and savings analysis
+6. Click **Save**.
+  </Tab>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your values
+NOPS_SERVICE_ACCOUNT="your-nops-sa@project.iam.gserviceaccount.com"
+BILLING_ACCOUNT_ID="XXXXXX-XXXXXX-XXXXXX"
+
+# Grant billing account roles
+gcloud billing accounts add-iam-policy-binding $BILLING_ACCOUNT_ID \
+    --member="serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --role="roles/billing.viewer" \
+    --quiet
+
+# For spend-based (Flex) CUD purchasing
+gcloud billing accounts add-iam-policy-binding $BILLING_ACCOUNT_ID \
+    --member="serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --role="roles/consumerprocurement.orderAdmin" \
+    --quiet
+
+# For CUD recommendations and savings analysis
+gcloud billing accounts add-iam-policy-binding $BILLING_ACCOUNT_ID \
+    --member="serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --role="roles/recommender.billingAccountCudAdmin" \
+    --quiet
+```
+  </Tab>
+</Tabs>
+
+### C. Project-Level Roles (Resource-Based Commitment Purchasing)
+
+Apply these roles to the **dedicated CUD project** where nOps will purchase commitments. The custom `nOpsResourceManager` role includes `compute.commitments.create`, which is the key permission for purchasing resource-based CUDs via the Compute Engine API.
+
+<Accordion title="Watch: Granting Project-Level Roles for Commitment Management">
+![GIF showing project-level role assignment](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/grant_project_roles.gif)
+</Accordion>
+
+<Tabs>
+  <Tab title="Console">
+1. Go to **IAM & Admin → IAM** in the [Google Cloud Console](https://console.cloud.google.com/iam-admin/iam).
+2. Select your **target project** from the top dropdown.
+3. Click **+ Grant Access**.
+4. Enter the nOps service account email.
+5. Add the following roles:
+   - **Compute Viewer** (`roles/compute.viewer`)
+   - **nOps Resource Manager** (the custom role you created)
+6. Click **Save**.
+  </Tab>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your values
+NOPS_SERVICE_ACCOUNT="your-nops-sa@project.iam.gserviceaccount.com"
+PROJECT_ID="your-target-project"
+ORGANIZATION_ID="123456789012"
+
+# Grant project-level roles
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --role="roles/compute.viewer" \
+    --quiet
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --role="organizations/$ORGANIZATION_ID/roles/nOpsResourceManager" \
+    --quiet
+```
+  </Tab>
+</Tabs>
+
+### D. Verify Automation Agent Permissions
+
+After granting all roles, verify the service account has the required permissions:
+
+```bash
+# Replace with your values
+NOPS_SERVICE_ACCOUNT="your-nops-sa@project.iam.gserviceaccount.com"
+ORGANIZATION_ID="123456789012"
+BILLING_ACCOUNT_ID="XXXXXX-XXXXXX-XXXXXX"
+CUD_PROJECT_ID="nops-cud-purchases"
+
+echo "=== Verifying Organization Roles ==="
+gcloud organizations get-iam-policy $ORGANIZATION_ID \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --format="table(bindings.role)"
+
+echo ""
+echo "=== Verifying Billing Account Roles ==="
+gcloud billing accounts get-iam-policy $BILLING_ACCOUNT_ID \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --format="table(bindings.role)"
+
+echo ""
+echo "=== Verifying CUD Project Roles ==="
+gcloud projects get-iam-policy $CUD_PROJECT_ID \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:serviceAccount:$NOPS_SERVICE_ACCOUNT" \
+    --format="table(bindings.role)"
+
+echo ""
+echo "=== Testing Commitment Permissions ==="
+gcloud projects test-iam-permissions $CUD_PROJECT_ID \
+    --permissions=compute.commitments.create,compute.commitments.list,compute.commitments.get,compute.commitments.update
+```
+
+**Expected output:**
+- Organization: `roles/browser` (and optionally `roles/cloudsupport.techSupportEditor`)
+- Billing Account: `roles/billing.viewer`, `roles/recommender.billingAccountCudAdmin`
+- Project: `roles/compute.viewer`, `organizations/[ORG_ID]/roles/nOpsResourceManager`
+- Permissions test: All four permissions should be listed as granted
+
+<Tip>
+If any permissions are missing:
+1. Re-run the grant commands for the missing scope
+2. Wait 1-2 minutes for IAM propagation
+3. Re-run the verification commands
+</Tip>
+
+---
+
+## Step 5: Configure Human Manager (nOps Console User)
+
+For manual dashboard access and override capabilities, grant the nOps group email the necessary permissions.
+
+<Info>
+**nOps Group Email** -- nOps will provide you with a group email (e.g., `gcp-cm-XXXX@nops.io`) in the nOps UI. Our team uses this email to access the GCP Console for manual operations, dashboards, and verification.
+</Info>
+
+### A. Organization-Level Roles (Paid Support Plans)
+
+<Info>
+The `roles/cloudsupport.techSupportEditor` role **only works with paid Google Cloud support plans** (Standard, Enhanced, or Premium). If you have a paid support plan, complete this section to enable support ticket creation.
+
+If your organization has **Basic (billing-only)** support, skip this section -- you can still contact [Cloud Billing Support](https://cloud.google.com/support/billing) for CUD-related issues at no cost.
+
+**To check your support plan:** Go to [Support → Overview](https://console.cloud.google.com/support/overview) in the Google Cloud Console and look for "Your current Customer Care service."
+</Info>
+
+<Tabs>
+  <Tab title="Console">
+1. Go to **IAM & Admin → IAM** in the [Google Cloud Console](https://console.cloud.google.com/iam-admin/iam).
+2. Select your **Organization** from the top dropdown.
+3. Click **+ Grant Access**.
+4. Enter the nOps group email shown in the nOps UI (e.g., `gcp-cm-XXXX@nops.io`).
+5. Add the following role:
+   - **Cloud Support Tech Support Editor** (`roles/cloudsupport.techSupportEditor`) -- *For creating and managing support tickets (e.g., CUD cancellation requests)*
+6. Click **Save**.
+  </Tab>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your values (use the nOps group email shown in the nOps UI)
+GROUP_EMAIL="gcp-cm-XXXX@nops.io"
+ORGANIZATION_ID="123456789012"
+
+# Grant organization-level role for support ticket creation (paid support plans only)
+gcloud organizations add-iam-policy-binding $ORGANIZATION_ID \
+    --member="group:$GROUP_EMAIL" \
+    --role="roles/cloudsupport.techSupportEditor" \
+    --quiet
+```
+  </Tab>
+</Tabs>
+
+### B. Billing Account Roles
+
+Grant the nOps group email access to view billing and CUD information:
+
+<Accordion title="Watch: Granting Human Manager Billing Access">
+![GIF showing human manager billing role assignment](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/human_manager_billing_roles.gif)
+</Accordion>
+
+<Tabs>
+  <Tab title="Console">
+1. Go to **Billing → Account Management** in the [Google Cloud Console](https://console.cloud.google.com/billing).
+2. Click **Show info panel** in the top-right corner.
+3. Click **+ Add Principal**.
+4. Enter the nOps group email shown in the nOps UI (e.g., `gcp-cm-XXXX@nops.io`).
+5. Add the following roles:
+   - **Billing Account Viewer** (`roles/billing.viewer`)
+   - **Recommender Billing Account CUD Viewer** (`roles/recommender.billingAccountCudViewer`)
+6. Click **Save**.
+  </Tab>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your values (use the nOps group email shown in the nOps UI)
+GROUP_EMAIL="gcp-cm-XXXX@nops.io"
+BILLING_ACCOUNT_ID="XXXXXX-XXXXXX-XXXXXX"
+
+# Grant billing account roles
+gcloud billing accounts add-iam-policy-binding $BILLING_ACCOUNT_ID \
+    --member="group:$GROUP_EMAIL" \
+    --role="roles/billing.viewer" \
+    --quiet
+
+gcloud billing accounts add-iam-policy-binding $BILLING_ACCOUNT_ID \
+    --member="group:$GROUP_EMAIL" \
+    --role="roles/recommender.billingAccountCudViewer" \
+    --quiet
+```
+  </Tab>
+</Tabs>
+
+### C. Project-Level Roles
+
+Grant the nOps group email access to view VMs and manage commitments manually:
+
+<Accordion title="Watch: Granting Human Manager Project Access">
+![GIF showing human manager project role assignment](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/human_manager_project_roles.gif)
+</Accordion>
+
+<Tabs>
+  <Tab title="Console">
+1. Go to **IAM & Admin → IAM** in the [Google Cloud Console](https://console.cloud.google.com/iam-admin/iam).
+2. Select your **target project** from the top dropdown.
+3. Click **+ Grant Access**.
+4. Enter the nOps group email shown in the nOps UI.
+5. Add the following roles:
+   - **Compute Viewer** (`roles/compute.viewer`) -- *Required to populate Machine Family and Region dropdowns*
+   - **nOps Resource Manager** (the custom role) -- *For manual commitment purchases*
+6. Click **Save**.
+  </Tab>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your values (use the nOps group email shown in the nOps UI)
+GROUP_EMAIL="gcp-cm-XXXX@nops.io"
+PROJECT_ID="your-target-project"
+ORGANIZATION_ID="123456789012"
+
+# Grant project-level roles
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="group:$GROUP_EMAIL" \
+    --role="roles/compute.viewer" \
+    --quiet
+
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="group:$GROUP_EMAIL" \
+    --role="organizations/$ORGANIZATION_ID/roles/nOpsResourceManager" \
+    --quiet
+```
+  </Tab>
+</Tabs>
+
+---
+
+## Step 6: Enable Required APIs
+
+Ensure the following APIs are enabled on the **dedicated CUD project** where commitments will be purchased:
+
+<Accordion title="Watch: Enabling Required APIs">
+![GIF showing API enablement](https://nops-help-site-assets-prod.s3.us-west-2.amazonaws.com/bc_plus/integrations/gcp/commitment_management/enable_apis.gif)
+</Accordion>
+
+**Required for Commitment Purchasing:**
+
+| API | Service ID | Purpose |
+|-----|------------|---------|
+| Compute Engine API | `compute.googleapis.com` | **Purchase resource-based CUDs** via `regionCommitments.insert` |
+| Cloud Commerce Consumer Procurement API | `cloudcommerceconsumerprocurement.googleapis.com` | **Purchase spend-based (Flex) CUDs** via Procurement API |
+
+**Required for Operations:**
+
+| API | Service ID | Purpose |
+|-----|------------|---------|
+| Cloud Asset API | `cloudasset.googleapis.com` | Asset inventory and export |
+| Cloud Quotas API | `cloudquotas.googleapis.com` | Auto-fix quotas before purchasing |
+| Service Usage API | `serviceusage.googleapis.com` | Service quota management |
+| Recommender API | `recommender.googleapis.com` | CUD recommendations and savings analysis |
+
+<Tabs>
+  <Tab title="Console">
+1. Go to **APIs & Services → Library** in the [Google Cloud Console](https://console.cloud.google.com/apis/library).
+2. Select your **dedicated CUD project**.
+3. Search for and enable each API listed above.
+  </Tab>
+  <Tab title="gcloud CLI">
+```bash
+# Replace with your CUD project ID
+PROJECT_ID="nops-cud-purchases"
+
+# Enable required APIs for commitment purchasing
+gcloud services enable \
+    compute.googleapis.com \
+    cloudcommerceconsumerprocurement.googleapis.com \
+    cloudasset.googleapis.com \
+    cloudquotas.googleapis.com \
+    serviceusage.googleapis.com \
+    recommender.googleapis.com \
+    --project=$PROJECT_ID
+```
+  </Tab>
+</Tabs>
+
+---
+
+## Verification Checklist
+
+After completing the setup, verify the configuration:
+
+### Automation Agent (Service Account)
+
+| Check | Command |
+|-------|---------|
+| Organization browser access | `gcloud organizations get-iam-policy $ORGANIZATION_ID --filter="bindings.members:serviceAccount:$NOPS_SA"` |
+| Billing account access | `gcloud billing accounts get-iam-policy $BILLING_ACCOUNT_ID --filter="bindings.members:serviceAccount:$NOPS_SA"` |
+| Custom role exists | `gcloud iam roles describe nOpsResourceManager --organization=$ORGANIZATION_ID` |
+| Project-level access | `gcloud projects get-iam-policy $PROJECT_ID --filter="bindings.members:serviceAccount:$NOPS_SA"` |
+
+### Human Manager (nOps Group Email)
+
+| Check | How to Verify |
+|-------|--------------|
+| Console login | nOps team logs in to [GCP Console](https://console.cloud.google.com) with the group email credentials |
+| Billing access | Navigate to **Billing → CUD analysis** and verify data loads |
+| Commitment purchase UI | Navigate to **Compute Engine → Committed use discounts** and verify dropdowns populate |
+| Support ticket access | Navigate to **Support → Cases** and verify ability to create new cases *(paid support plans only)* |
+
+---
+
+## Summary of Role Assignments
+
+### Automation Agent (Service Account)
+
+| Scope | Role | Purpose |
+|-------|------|---------|
+| Organization | `roles/browser` | Browse org hierarchy |
+| Organization | `roles/cloudsupport.techSupportEditor` | Support tickets *(paid support plans only)* |
+| Billing Account | `roles/billing.viewer` | View spend data |
+| Billing Account | `roles/consumerprocurement.orderAdmin` | **Purchase spend-based (Flex) CUDs** via Procurement API |
+| Billing Account | `roles/recommender.billingAccountCudAdmin` | Access CUD recommendations and savings analysis |
+| Project (CUD) | `roles/compute.viewer` | View VMs for coverage analysis |
+| Project (CUD) | Custom: `nOpsResourceManager` | **Purchase resource-based CUDs** (includes `compute.commitments.create`) |
+
+### Human Manager (nOps Group Email)
+
+| Scope | Role | Purpose |
+|-------|------|---------|
+| Organization | `roles/cloudsupport.techSupportEditor` | Support tickets *(paid support plans only)* |
+| Billing Account | `roles/billing.viewer` | View billing dashboard |
+| Billing Account | `roles/recommender.billingAccountCudViewer` | View CUD recommendations |
+| Project (CUD) | `roles/compute.viewer` | Populate UI dropdowns |
+| Project (CUD) | Custom: `nOpsResourceManager` | Manual commitment purchasing and management |
+
+<Tip>
+**Support Plan Options**
+- **Paid support plans (Standard/Enhanced/Premium):** Assign the `techSupportEditor` role to enable support ticket creation for CUD issues.
+- **Basic (billing-only) support:** Skip the `techSupportEditor` role. You can still request CUD cancellations through [Cloud Billing Support](https://cloud.google.com/support/billing) at no cost.
+</Tip>
+
+---
+
+## API Reference
+
+nOps uses Google Cloud APIs to programmatically manage commitments on your behalf. This section provides technical details for advanced users and auditing purposes.
+
+### Resource-Based CUDs (Compute Engine API)
+
+Resource-based commitments are managed through the Compute Engine API under the `regionCommitments` resource collection.
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| `regionCommitments.insert` | `POST /compute/v1/projects/{project}/regions/{region}/commitments` | Create a commitment |
+| `regionCommitments.list` | `GET /compute/v1/projects/{project}/regions/{region}/commitments` | List commitments in a region |
+| `regionCommitments.aggregatedList` | `GET /compute/v1/projects/{project}/aggregated/commitments` | List commitments across all regions |
+| `regionCommitments.get` | `GET /compute/v1/projects/{project}/regions/{region}/commitments/{commitment}` | Get commitment details |
+
+**Resource Path Pattern:**
+```
+projects/{project}/regions/{region}/commitments/{name}
+```
+
+**Required IAM Permissions:**
+
+| Permission | Required For |
+|------------|--------------|
+| `compute.commitments.create` | Creating new commitments |
+| `compute.commitments.get` | Viewing commitment details |
+| `compute.commitments.list` | Listing commitments |
+| `compute.commitments.update` | Modifying commitments |
+| `compute.commitments.updateReservations` | Updating attached reservations |
+
+**Commitment Statuses:**
+
+| Status | Description |
+|--------|-------------|
+| `NOT_YET_ACTIVE` | Initial status when created via API/CLI |
+| `PENDING` | Initial status when created via Console |
+| `ACTIVE` | Commitment is active and applying discounts |
+| `EXPIRED` | Commitment has expired (removed after 210 days) |
+| `CANCELED` | Commitment was canceled (e.g., during merge operations) |
+
+### Spend-Based (Flex) CUDs (Procurement API)
+
+Spend-based commitments are managed through the Cloud Commerce Consumer Procurement API at the billing account level.
+
+| Method | Purpose |
+|--------|---------|
+| `billingAccounts.orders.place` | Purchase a spend-based commitment |
+| `billingAccounts.orders.get` | Retrieve order details |
+| `billingAccounts.orders.list` | List orders |
+| `billingAccounts.orders.modify` | Modify an order |
+
+**Required IAM Roles:**
+
+| Role | Description |
+|------|-------------|
+| `roles/consumerprocurement.orderAdmin` | Procurement-specific operations (recommended) |
+| `roles/billing.admin` | Full billing management (alternative) |
+
+<Info>
+The Procurement API operates at the **billing account level**, not the project level. Spend-based CUDs purchased through this API automatically apply discounts across all projects in the billing account.
+</Info>
+
+### Terraform Resources
+
+For infrastructure-as-code integration, use the `google_compute_region_commitment` Terraform resource:
+
+```hcl
+resource "google_compute_region_commitment" "example" {
+  name   = "example-commitment"
+  plan   = "TWELVE_MONTH"  # or "THIRTY_SIX_MONTH"
+  region = "us-central1"
+
+  resources {
+    type   = "VCPU"
+    amount = "8"
+  }
+
+  resources {
+    type   = "MEMORY"
+    amount = "32768"  # MB
+  }
+}
+```
+
+**Import format:** `terraform import google_compute_region_commitment.example projects/{project}/regions/{region}/commitments/{name}`
+
+### Additional Resources
+
+- [GCP Committed Use Discounts Overview](https://cloud.google.com/compute/docs/instances/committed-use-discounts-overview)
+- [regionCommitments API Reference](https://cloud.google.com/compute/docs/reference/rest/v1/regionCommitments)
+- [Procurement API Documentation](https://cloud.google.com/marketplace/docs/commitment-api-purchasing)
+- [Terraform google_compute_region_commitment](https://registry.terraform.io/providers/hashicorp/google/latest/docs/resources/compute_region_commitment)
